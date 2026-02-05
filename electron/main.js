@@ -2,17 +2,28 @@ import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { writeFileSync, existsSync } from "node:fs";
+import { writeFileSync, existsSync, mkdirSync } from "node:fs";
+import os from "node:os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 日志函数
-const logFile = path.join(app.getPath("userData"), "debug.log");
+// 日志函数 - 使用固定的临时目录，不依赖 app.getPath
+const logDir = path.join(os.tmpdir(), "opencode-config-switcher-logs");
+try { mkdirSync(logDir, { recursive: true }); } catch {}
+const logFile = path.join(logDir, "debug.log");
+
 const log = (msg) => {
-  const line = `[${new Date().toISOString()}] ${msg}\n`;
-  writeFileSync(logFile, line, { flag: "a" });
+  try {
+    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    writeFileSync(logFile, line, { flag: "a" });
+  } catch (e) {
+    // ignore
+  }
 };
+
+log(`App starting...`);
+log(`logFile: ${logFile}`);
 
 // 判断是否在打包环境中
 const isDev = process.env.VITE_DEV_SERVER_URL !== undefined;
