@@ -1,73 +1,108 @@
-# React + TypeScript + Vite
+# OpenCode 配置切换器
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+一款用于管理 OpenCode 多配置版本的桌面应用，支持在不同配置版本之间快速切换。
 
-Currently, two official plugins are available:
+## 功能特性
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **多配置文件管理**：添加并管理多个 JSON 配置文件
+- **版本管理**：为每个配置文件创建多个版本（配置方案）
+- **差异对比**：使用 Monaco 编辑器实时对比源文件与版本内容的差异
+- **一键切换**：点击即可将指定版本应用到配置文件
+- **导入/导出**：支持导入导出所有版本配置，方便备份和迁移
 
-## React Compiler
+## 安装
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### 下载安装包
 
-## Expanding the ESLint configuration
+从 [Releases](../../releases) 页面下载对应系统的安装包：
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- **Windows**: `opencode-config-switcher-x.x.x-setup.exe`
+- **macOS**: `opencode-config-switcher-x.x.x.dmg`
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+### 从源码构建
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+```bash
+# 克隆仓库
+git clone https://github.com/user/opencode-config-switcher.git
+cd opencode-config-switcher
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+# 安装依赖
+npm install
+
+# 开发模式运行
+npm run electron:dev
+
+# 构建生产版本
+npm run electron:build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## 使用指南
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+### 1. 添加配置文件
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+1. 点击左侧面板的「添加配置文件」按钮
+2. 在弹出的文件选择器中选择要管理的 JSON 配置文件
+3. 文件会出现在左侧的文件列表中
+
+### 2. 创建版本
+
+1. 在文件下方点击「+ 新建版本」按钮
+2. 输入版本名称（如 "开发环境"、"生产环境"）
+3. 点击确定创建版本
+
+### 3. 编辑版本内容
+
+1. 点击左侧的版本名称选中它
+2. 右侧 Diff 编辑器会显示对比：
+   - **左侧**：源文件当前内容
+   - **右侧**：版本内容（可编辑）
+3. 在右侧编辑器中修改配置
+4. 修改后会出现「保存并应用」按钮
+
+### 4. 保存并应用版本
+
+- **保存并应用**：点击右上角的「保存并应用」按钮，将修改保存到版本并同时写入源文件
+- **仅应用**：点击版本右侧的「应用」按钮，将已保存的版本内容写入源文件
+
+### 5. 版本管理
+
+- **重命名**：点击版本右侧的 ⋯ 菜单，选择「重命名」
+- **删除**：点击版本右侧的 ⋯ 菜单，选择「删除」
+- **当前生效**：标有「当前生效」的版本表示其内容与源文件一致
+
+### 6. 导入/导出配置
+
+- **导出**：点击「导出」按钮，将所有版本配置保存为 JSON 文件
+- **导入**：点击「导入」按钮，从 JSON 文件恢复版本配置
+
+## 界面说明
+
 ```
+┌─────────────────────────────────────────────────────────────┐
+│  OpenCode 配置切换器                                         │
+├──────────────┬──────────────────────────────────────────────┤
+│ 文件与版本    │  Diff                                        │
+│              │ ┌──────────────┬───────────────────────────┐ │
+│ [添加] [导出] │ │ 源文件内容   │ 版本：xxx    [保存并应用] │ │
+│ [导入]       │ ├──────────────┼───────────────────────────┤ │
+│ ─────────────│ │              │                           │ │
+│ /path/to/cfg │ │   左侧编辑器  │      右侧编辑器           │ │
+│   开发环境    │ │   (源文件)   │      (版本内容)           │ │
+│   生产环境 ✓  │ │              │                           │ │
+│   + 新建版本  │ │              │                           │ │
+│              │ └──────────────┴───────────────────────────┘ │
+├──────────────┴──────────────────────────────────────────────┤
+│ 状态栏                                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 技术栈
+
+- **框架**: Electron + React + TypeScript
+- **构建工具**: Vite
+- **编辑器**: Monaco Editor (VS Code 同款)
+- **JSON 解析**: jsonc-parser
+
+## 许可证
+
+MIT License

@@ -1,11 +1,11 @@
 import { DiffEditor } from '@monaco-editor/react'
 import { parseTree } from 'jsonc-parser'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Node as JsonNode } from 'jsonc-parser'
 import './App.css'
 import type { PatchRecord } from './types'
 
-const getRangeForPointer = (root: JsonNode | undefined, pointer: string) => {
+const getRangeForPointer = (root: JsonNode | undefined, pointer: string): { start: number; end: number } | null => {
   if (!root) return null
   if (!pointer || pointer === '/') return { start: root.offset, end: root.offset + root.length }
   const segments = pointer.split('/').filter(Boolean)
@@ -13,7 +13,7 @@ const getRangeForPointer = (root: JsonNode | undefined, pointer: string) => {
   for (const segment of segments) {
     if (!current) return null
     if (current.type === 'object') {
-      const property = current.children?.find((child) => child.children?.[0]?.value === segment)
+      const property: JsonNode | undefined = current.children?.find((child) => child.children?.[0]?.value === segment)
       current = property?.children?.[1]
     } else if (current.type === 'array') {
       const index = Number(segment)
@@ -75,37 +75,86 @@ const diffValues = (base: unknown, current: unknown, pointer = ''): string[] => 
 }
 
 function App() {
+  // ============ 基础状态 ============
   const [records, setRecords] = useState<PatchRecord[]>([])
   const [files, setFiles] = useState<string[]>([])
-  const [activeFile, setActiveFile] = useState<string | null>(null)
   const [profiles, setProfiles] = useState<Record<string, string[]>>({})
+  const [activeFile, setActiveFile] = useState<string | null>(null)
   const [activeProfile, setActiveProfile] = useState<string | null>(null)
+  const [baselineByFile, setBaselineByFile] = useState<Record<string, string>>({})
+  const [appliedProfileByFile, setAppliedProfileByFile] = useState<Record<string, string>>({})
+  
+  // ============ 编辑器状态 ============
   const [sourceContent, setSourceContent] = useState<string>('')
   const [rightContent, setRightContent] = useState<string>('')
-  const [baselineByFile, setBaselineByFile] = useState<Record<string, string>>({})
-  const [pendingPaths, setPendingPaths] = useState<string[]>([])
+  const [diffEditor, setDiffEditor] = useState<any>(null)
+  const [lastEditedSide, setLastEditedSide] = useState<'left' | 'right' | null>(null)
+  
+  // ============ UI 状态 ============
   const [status, setStatus] = useState<string>('')
   const [error, setError] = useState<string>('')
-  const [appliedProfileByFile, setAppliedProfileByFile] = useState<Record<string, string>>({})
   const [showProfileModal, setShowProfileModal] = useState(false)
   const [profileInput, setProfileInput] = useState('')
   const [showProfileMenu, setShowProfileMenu] = useState<{ file: string; profile: string; x: number; y: number } | null>(null)
   const [renameTarget, setRenameTarget] = useState<{ file: string; profile: string } | null>(null)
   const [renameInput, setRenameInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<{ file: string; profile: string } | null>(null)
-  const [diffEditor, setDiffEditor] = useState<any>(null)
-  const [lastEditedSide, setLastEditedSide] = useState<'left' | 'right' | null>(null)
+  
+  // ============ 关键：用于追踪右侧内容的"快照" ============
+  // 这是切换版本时右侧应该显示的内容，用于判断是否有未保存的修改
+  const [snapshotRightContent, setSnapshotRightContent] = useState<string>('')
+  
+  // 用于防止程序设置内容时触发脏检测
+  const isProgrammaticChangeRef = useRef(false)
 
+  // ============ 计算属性 ============
+  
+  // 计算当前版本在 JSONL 中存储的内容
+  const computeVersionContent = (file: string, profile: string, baseline: string, recordList: PatchRecord[]) => {
+    const patches = recordList.filter(
+      (r) => r.file === file && r.profile === profile && r.path !== '__placeholder__'
+    )
+    return applyPatches(baseline, patches)
+  }
+
+  // 计算 pendingPaths（用于保存时提取差异路径）
+  const pendingPaths = useMemo(() => {
+    try {
+      const baseline = activeFile ? (baselineByFile[activeFile] ?? sourceContent) : sourceContent
+      const baseObj = JSON.parse(baseline)
+      const currentObj = JSON.parse(rightContent)
+      const diffs = diffValues(baseObj, currentObj, '')
+      return diffs.filter((path) => path !== '')
+    } catch {
+      return []
+    }
+  }, [activeFile, baselineByFile, sourceContent, rightContent])
+
+  // ============ 保存按钮显示逻辑 ============
+  // 条件：选中了版本 && 右侧内容与快照不同
+  const isDirty = useMemo(() => {
+    if (!activeFile || !activeProfile) return false
+    if (!snapshotRightContent) return false
+    return rightContent !== snapshotRightContent
+  }, [activeFile, activeProfile, rightContent, snapshotRightContent])
+
+  const leftDirty = activeFile ? baselineByFile[activeFile] && baselineByFile[activeFile] !== sourceContent : false
+
+  // ============ 初始化：启动时加载数据并检测当前生效版本 ============
   useEffect(() => {
     if (!window.api) {
       setError('Electron API 未注入，请用 npm run electron:dev 启动')
       return
     }
-    window.api.readStorage().then((data) => {
+    
+    const initializeApp = async () => {
+      const data = await window.api!.readStorage()
       const normalized = (data as PatchRecord[]) ?? []
       setRecords(normalized)
+      
       const fileSet = Array.from(new Set(normalized.map((r) => r.file)))
       setFiles(fileSet)
+      
       const profileMap: Record<string, string[]> = {}
       normalized.forEach((record) => {
         if (!profileMap[record.file]) profileMap[record.file] = []
@@ -114,85 +163,125 @@ function App() {
         }
       })
       setProfiles(profileMap)
-    })
+      
+      // 读取所有文件并检测当前生效版本
+      const appliedMap: Record<string, string> = {}
+      const baselineMap: Record<string, string> = {}
+      
+      for (const file of fileSet) {
+        try {
+          const diskContent = await window.api!.readFile(file)
+          baselineMap[file] = diskContent
+          
+          const fileProfiles = profileMap[file] ?? []
+          for (const profile of fileProfiles) {
+            const versionContent = computeVersionContent(file, profile, diskContent, normalized)
+            if (versionContent === diskContent) {
+              appliedMap[file] = profile
+              break
+            }
+          }
+        } catch {
+          // 文件读取失败，跳过
+        }
+      }
+      
+      setBaselineByFile(baselineMap)
+      setAppliedProfileByFile(appliedMap)
+    }
+    
+    initializeApp()
   }, [])
 
+  // ============ 切换文件时加载内容 ============
+  // 注意：只加载文件内容到左侧，不重置 activeProfile
+  // activeProfile 的处理由 handleSelectProfile 和版本切换的 useEffect 负责
   useEffect(() => {
-    if (!activeFile) return
-    if (!window.api) return
-    window.api.readFile(activeFile)
-      .then((content) => {
-        setSourceContent(content)
-        setBaselineByFile((prev) => ({ ...prev, [activeFile]: content }))
+    if (!activeFile || !window.api) return
+    
+    const loadFile = async () => {
+      let content = baselineByFile[activeFile]
+      if (!content) {
+        try {
+          content = await window.api!.readFile(activeFile)
+          setBaselineByFile((prev) => ({ ...prev, [activeFile]: content }))
+        } catch (err) {
+          setError(String(err))
+          return
+        }
+      }
+      
+      isProgrammaticChangeRef.current = true
+      setSourceContent(content)
+      // 如果没有选中版本，右侧也显示原文件内容
+      if (!activeProfile) {
         setRightContent(content)
-      })
-      .catch((err) => {
-        setError(String(err))
-      })
-  }, [activeFile])
-
-  useEffect(() => {
-    try {
-      const baseline = activeFile ? (baselineByFile[activeFile] ?? sourceContent) : sourceContent
-      const baseObj = JSON.parse(baseline)
-      const currentObj = JSON.parse(rightContent)
-      const diffs = diffValues(baseObj, currentObj, '')
-      const normalized = diffs.filter((path) => path !== '')
-      setPendingPaths(normalized)
-    } catch {
-      setPendingPaths([])
+        setSnapshotRightContent(content)
+      }
     }
-  }, [activeFile, baselineByFile, sourceContent, rightContent])
+    
+    loadFile()
+  }, [activeFile, activeProfile, baselineByFile])
 
+  // ============ 切换版本时更新右侧内容 ============
+  useEffect(() => {
+    if (!activeFile || !activeProfile) return
+    
+    const baseline = baselineByFile[activeFile]
+    if (!baseline) return
+    
+    const versionContent = computeVersionContent(activeFile, activeProfile, baseline, records)
+    
+    isProgrammaticChangeRef.current = true
+    setRightContent(versionContent)
+    setSnapshotRightContent(versionContent)  // 更新快照
+  }, [activeFile, activeProfile, baselineByFile, records])
+
+  // ============ 监听编辑器内容变化 ============
   useEffect(() => {
     if (!diffEditor) return
+    
     const original = diffEditor.getOriginalEditor()
     const modified = diffEditor.getModifiedEditor()
     const originalModel = original.getModel()
     const modifiedModel = modified.getModel()
     if (!originalModel || !modifiedModel) return
+    
     const sub1 = originalModel.onDidChangeContent(() => {
       setLastEditedSide('left')
       setSourceContent(originalModel.getValue())
     })
+    
     const sub2 = modifiedModel.onDidChangeContent(() => {
+      // 如果是程序设置的内容，跳过
+      if (isProgrammaticChangeRef.current) {
+        isProgrammaticChangeRef.current = false
+        return
+      }
       setLastEditedSide('right')
       setRightContent(modifiedModel.getValue())
     })
+    
     return () => {
       sub1.dispose()
       sub2.dispose()
     }
   }, [diffEditor])
 
+  // ============ 左侧编辑时同步更新右侧 ============
   useEffect(() => {
     if (!activeFile || !activeProfile) return
     if (lastEditedSide !== 'left') return
+    
     const patches = records.filter((r) => r.file === activeFile && r.profile === activeProfile)
     const updated = applyPatches(sourceContent, patches)
+    
+    isProgrammaticChangeRef.current = true
     setRightContent(updated)
   }, [sourceContent, activeFile, activeProfile, records, lastEditedSide])
 
-  useEffect(() => {
-    if (!diffEditor) return
-    const original = diffEditor.getOriginalEditor()
-    const modified = diffEditor.getModifiedEditor()
-    const originalModel = original.getModel()
-    const modifiedModel = modified.getModel()
-    if (!originalModel || !modifiedModel) return
-    const sub1 = originalModel.onDidChangeContent(() => {
-      setSourceContent(originalModel.getValue())
-    })
-    const sub2 = modifiedModel.onDidChangeContent(() => {
-      setRightContent(modifiedModel.getValue())
-    })
-    return () => {
-      sub1.dispose()
-      sub2.dispose()
-    }
-  }, [diffEditor])
-
-
+  // ============ 操作函数 ============
+  
   const handleAddFile = async () => {
     setError('')
     setStatus('正在选择文件…')
@@ -239,11 +328,12 @@ function App() {
     }
   }
 
-  const handleSelectProfile = (name: string) => {
+  const handleSelectProfile = (file: string, name: string) => {
+    setActiveFile(file)
     setActiveProfile(name)
   }
 
-  const handleSaveProfile = () => {
+  const handleSaveAndApplyProfile = async () => {
     setError('')
     setStatus('')
     if (!activeFile || !activeProfile) {
@@ -259,6 +349,8 @@ function App() {
       setError('JSON 解析失败，无法保存')
       return
     }
+    
+    // 移除旧的 patches，添加新的
     const newRecords: PatchRecord[] = records.filter(
       (r) => !(r.file === activeFile && r.profile === activeProfile)
     )
@@ -274,30 +366,48 @@ function App() {
         }
       })
       .filter(Boolean) as PatchRecord[]
+    
     const merged = [...newRecords, ...patches]
     setRecords(merged)
+    
     if (!window.api) return
-    window.api.writeStorage(merged)
-    setRightContent(rightContent)
-    setStatus('已保存版本')
+    await window.api.writeStorage(merged)
+    
+    // 保存成功后，更新快照为当前内容
+    setSnapshotRightContent(rightContent)
+    
+    // 应用到文件
+    await window.api.writeFile(activeFile, rightContent)
+    setBaselineByFile((prev) => ({ ...prev, [activeFile]: rightContent }))
+    setAppliedProfileByFile((prev) => ({ ...prev, [activeFile]: activeProfile }))
+    
+    isProgrammaticChangeRef.current = true
+    setSourceContent(rightContent)
+    
+    setStatus('已保存并应用版本')
   }
 
-  const handleApplyProfile = async () => {
+  const handleApplyProfile = async (file: string, profile: string) => {
     setError('')
     setStatus('')
-    if (!activeFile || !activeProfile) {
-      setError('请选择文件与版本')
-      return
-    }
     if (!window.api) return
-    const content = await window.api.readFile(activeFile)
-    const patchList = records.filter((r) => r.file === activeFile && r.profile === activeProfile && r.path !== '__placeholder__')
+    
+    const content = await window.api.readFile(file)
+    const patchList = records.filter((r) => r.file === file && r.profile === profile && r.path !== '__placeholder__')
     const updated = applyPatches(content, patchList)
-    await window.api.writeFile(activeFile, updated)
-    setSourceContent(updated)
-    setBaselineByFile((prev) => ({ ...prev, [activeFile]: updated }))
-    setAppliedProfileByFile((prev) => ({ ...prev, [activeFile]: activeProfile }))
-    setRightContent(updated)
+    await window.api.writeFile(file, updated)
+    
+    // 更新状态
+    setBaselineByFile((prev) => ({ ...prev, [file]: updated }))
+    setAppliedProfileByFile((prev) => ({ ...prev, [file]: profile }))
+    
+    if (activeFile === file) {
+      isProgrammaticChangeRef.current = true
+      setSourceContent(updated)
+      setRightContent(updated)
+      setSnapshotRightContent(updated)
+    }
+    
     setStatus('已应用版本')
   }
 
@@ -305,11 +415,17 @@ function App() {
     if (!activeFile || !window.api) return
     await window.api.writeFile(activeFile, sourceContent)
     setBaselineByFile((prev) => ({ ...prev, [activeFile]: sourceContent }))
+    
     if (activeProfile) {
       const patches = records.filter((r) => r.file === activeFile && r.profile === activeProfile)
-      setRightContent(applyPatches(sourceContent, patches))
+      const updated = applyPatches(sourceContent, patches)
+      isProgrammaticChangeRef.current = true
+      setRightContent(updated)
+      setSnapshotRightContent(updated)
     } else {
+      isProgrammaticChangeRef.current = true
       setRightContent(sourceContent)
+      setSnapshotRightContent(sourceContent)
     }
     setStatus('已保存并应用到所有版本')
   }
@@ -383,31 +499,21 @@ function App() {
     () => ({
       fontSize: 12,
       minimap: { enabled: false },
-      wordWrap: 'on',
+      wordWrap: 'on' as const,
       renderSideBySide: true,
       formatOnType: false,
       formatOnPaste: false,
-      autoClosingBrackets: 'never',
-      autoClosingQuotes: 'never',
+      autoClosingBrackets: 'never' as const,
+      autoClosingQuotes: 'never' as const,
+      scrollbar: {
+        verticalScrollbarSize: 8,
+        horizontalScrollbarSize: 8,
+      },
     }),
     []
   )
 
-  const savedVersionContent = (() => {
-    if (!activeFile || !activeProfile) return rightContent
-    const base = baselineByFile[activeFile] ?? sourceContent
-    const patches = records.filter((r) => r.file === activeFile && r.profile === activeProfile && r.path !== '__placeholder__')
-    return applyPatches(base, patches)
-  })()
-
-  useEffect(() => {
-    if (!activeFile || !activeProfile) return
-    setRightContent(savedVersionContent)
-  }, [activeFile, activeProfile, savedVersionContent])
-
-  const isDirty = activeFile && activeProfile ? savedVersionContent !== rightContent : false
-  const leftDirty = activeFile ? baselineByFile[activeFile] && baselineByFile[activeFile] !== sourceContent : false
-
+  // ============ 渲染 ============
   return (
     <div className="app">
       <header className="app-header">
@@ -431,10 +537,7 @@ function App() {
                     <div
                       key={profile}
                       className={`profile-item ${activeFile === file && activeProfile === profile ? 'active' : ''}`}
-                      onClick={() => {
-                        setActiveFile(file)
-                        handleSelectProfile(profile)
-                      }}
+                      onClick={() => handleSelectProfile(file, profile)}
                     >
                       <span>{profile}</span>
                       <div className="profile-inline">
@@ -442,7 +545,7 @@ function App() {
                           <span className="profile-label">当前生效</span>
                         )}
                         {appliedProfileByFile[file] !== profile && (
-                          <button onClick={handleApplyProfile}>应用</button>
+                          <button onClick={(e) => { e.stopPropagation(); handleApplyProfile(file, profile) }}>应用</button>
                         )}
                         <button
                           className="profile-menu"
@@ -463,31 +566,32 @@ function App() {
           </div>
         </section>
 
-        <section className="panel">
-          <div className="panel-header">源文件对比</div>
-          <div className="panel-body">
-            <div className="diff-header">
-              <div>
-                当前生效：{appliedProfileByFile[activeFile ?? ''] ?? '未应用'}
+        <section className="panel diff-panel">
+          <div className="panel-header">Diff</div>
+          <div className="panel-body diff-body">
+            <div className="diff-labels">
+              <div className="diff-label-left">
+                <span className="diff-label-text">源文件内容</span>
                 {leftDirty && (
-                  <button className="apply-all" onClick={handleSaveAllVersions}>保存并应用到所有版本</button>
+                  <button className="diff-label-btn" onClick={handleSaveAllVersions}>保存并应用到所有版本</button>
                 )}
               </div>
-              <div className="diff-actions">
+              <div className="diff-label-right">
+                <span className="diff-label-text">版本：{activeProfile ?? '未选择'}</span>
                 {isDirty && (
-                  <button className="save-version" onClick={handleSaveProfile}>保存</button>
+                  <button className="diff-label-btn primary" onClick={handleSaveAndApplyProfile}>保存并应用</button>
                 )}
-                <span>版本：{activeProfile ?? '未选择'}</span>
               </div>
             </div>
-            <DiffEditor
-              height="100%"
-              original={sourceContent}
-              modified={rightContent}
-              originalEditable={true}
-              onMount={(instance) => setDiffEditor(instance)}
-              options={editorOptions}
-            />
+            <div className="diff-editor-wrapper">
+              <DiffEditor
+                height="100%"
+                original={sourceContent}
+                modified={rightContent}
+                onMount={(instance) => setDiffEditor(instance)}
+                options={{ ...editorOptions, originalEditable: true }}
+              />
+            </div>
           </div>
         </section>
       </div>
