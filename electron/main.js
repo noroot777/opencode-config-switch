@@ -2,9 +2,17 @@ import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { writeFileSync, existsSync } from "node:fs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// 日志函数
+const logFile = path.join(app.getPath("userData"), "debug.log");
+const log = (msg) => {
+  const line = `[${new Date().toISOString()}] ${msg}\n`;
+  writeFileSync(logFile, line, { flag: "a" });
+};
 
 // 判断是否在打包环境中
 const isDev = process.env.VITE_DEV_SERVER_URL !== undefined;
@@ -43,6 +51,13 @@ const writeJsonl = async (filePath, records) => {
 };
 
 const createWindow = () => {
+  log(`Creating window...`);
+  log(`isDev: ${isDev}`);
+  log(`__dirname: ${__dirname}`);
+  log(`app.getAppPath(): ${app.getAppPath()}`);
+  log(`app.isPackaged: ${app.isPackaged}`);
+  log(`process.resourcesPath: ${process.resourcesPath}`);
+  
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -60,13 +75,48 @@ const createWindow = () => {
   Menu.setApplicationMenu(null);
   
   if (resolvedDevServerUrl) {
+    log(`Loading dev server: ${resolvedDevServerUrl}`);
     win.loadURL(resolvedDevServerUrl);
     win.webContents.openDevTools();
   } else {
-    // 打包后使用 app.getAppPath() 获取正确路径
-    const indexPath = path.join(app.getAppPath(), "dist", "index.html");
-    win.loadFile(indexPath);
+    // 尝试多个可能的路径
+    const possiblePaths = [
+      path.join(app.getAppPath(), "dist", "index.html"),
+      path.join(__dirname, "..", "dist", "index.html"),
+      path.join(process.resourcesPath, "app", "dist", "index.html"),
+      path.join(process.resourcesPath, "app.asar", "dist", "index.html"),
+    ];
+    
+    log(`Checking possible paths:`);
+    let indexPath = null;
+    for (const p of possiblePaths) {
+      const exists = existsSync(p);
+      log(`  ${p} -> exists: ${exists}`);
+      if (exists && !indexPath) {
+        indexPath = p;
+      }
+    }
+    
+    if (indexPath) {
+      log(`Loading file: ${indexPath}`);
+      win.loadFile(indexPath);
+    } else {
+      log(`ERROR: No valid index.html found!`);
+    }
   }
+  
+  // 监听加载错误
+  win.webContents.on("did-fail-load", (event, errorCode, errorDescription) => {
+    log(`did-fail-load: ${errorCode} - ${errorDescription}`);
+  });
+  
+  win.webContents.on("did-finish-load", () => {
+    log(`did-finish-load`);
+  });
+  
+  win.webContents.on("console-message", (event, level, message, line, sourceId) => {
+    log(`console [${level}]: ${message}`);
+  });
 };
 
 app.whenReady().then(async () => {
