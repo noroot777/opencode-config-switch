@@ -16,15 +16,15 @@
 
 从 [Releases](../../releases) 页面下载对应系统的安装包：
 
-- **Windows**: `opencode-config-switcher-x.x.x-setup.exe`
-- **macOS**: `opencode-config-switcher-x.x.x.dmg`
+- **Windows**: `opencode-config-switch-x.x.x-setup.exe`
+- **macOS**: `opencode-config-switch-x.x.x.dmg`
 
 ### 从源码构建
 
 ```bash
 # 克隆仓库
-git clone https://github.com/user/opencode-config-switcher.git
-cd opencode-config-switcher
+git clone https://github.com/user/opencode-config-switch.git
+cd opencode-config-switch
 
 # 安装依赖
 npm install

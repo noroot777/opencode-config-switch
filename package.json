@@ -1,5 +1,5 @@
 {
-  "name": "opencode-config-switcher",
+  "name": "opencode-config-switch",
   "private": true,
   "version": "1.0.0",
   "type": "module",
@@ -16,7 +16,7 @@
     "preview": "vite preview"
   },
   "build": {
-    "appId": "com.opencode.config-switcher",
+    "appId": "com.opencode.config-switch",
     "productName": "OpenCode 配置切换器",
     "directories": {
       "output": "release"
