@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // 日志函数 - 使用固定的临时目录，不依赖 app.getPath
-const logDir = path.join(os.tmpdir(), "opencode-config-switcher-logs");
+const logDir = path.join(os.tmpdir(), "opencode-config-switch-logs");
 try { mkdirSync(logDir, { recursive: true }); } catch {}
 const logFile = path.join(logDir, "debug.log");
 
