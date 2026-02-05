@@ -6,6 +6,9 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// 判断是否在打包环境中
+const isDev = process.env.VITE_DEV_SERVER_URL !== undefined;
+
 const ensureUserDataFile = async () => {
   const userDataPath = app.getPath("userData");
   const storagePath = path.join(userDataPath, "profiles.jsonl");
@@ -55,10 +58,13 @@ const createWindow = () => {
     ? devServerUrl.replace("localhost", "127.0.0.1")
     : null;
   Menu.setApplicationMenu(null);
+  
   if (resolvedDevServerUrl) {
     win.loadURL(resolvedDevServerUrl);
+    win.webContents.openDevTools();
   } else {
-    const indexPath = path.join(__dirname, "../dist/index.html");
+    // 打包后使用 app.getAppPath() 获取正确路径
+    const indexPath = path.join(app.getAppPath(), "dist", "index.html");
     win.loadFile(indexPath);
   }
 };
