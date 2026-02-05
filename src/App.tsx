@@ -1,9 +1,24 @@
 import { DiffEditor } from '@monaco-editor/react'
 import { parseTree } from 'jsonc-parser'
-import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Node as JsonNode } from 'jsonc-parser'
+import { useEffect, useMemo, useState } from 'react'
 import './App.css'
-import type { PatchRecord } from './types'
+
+interface VersionRecord {
+  file: string
+  profile: string
+  content: string  // 存储完整内容
+}
+
+// 旧格式 - 用于迁移
+interface OldPatchRecord {
+  file: string
+  profile: string
+  path: string
+  value: string
+}
+
+// ============ 旧格式迁移工具函数 ============
 
 const getRangeForPointer = (root: JsonNode | undefined, pointer: string): { start: number; end: number } | null => {
   if (!root) return null
@@ -27,11 +42,7 @@ const getRangeForPointer = (root: JsonNode | undefined, pointer: string): { star
   return { start: current.offset, end: current.offset + current.length }
 }
 
-const extractValueText = (content: string, range: { start: number; end: number }) => {
-  return content.slice(range.start, range.end)
-}
-
-const applyPatches = (content: string, patches: PatchRecord[]) => {
+const applyPatches = (content: string, patches: OldPatchRecord[]) => {
   const root = parseTree(content)
   if (!root) return content
   let updated = content
@@ -48,47 +59,78 @@ const applyPatches = (content: string, patches: PatchRecord[]) => {
   return updated
 }
 
-const diffValues = (base: unknown, current: unknown, pointer = ''): string[] => {
-  if (base === current) return []
-  const baseIsArray = Array.isArray(base)
-  const currentIsArray = Array.isArray(current)
-  if (baseIsArray || currentIsArray) {
-    if (!baseIsArray || !currentIsArray) return [pointer]
-    const max = Math.max(base.length, current.length)
-    const result: string[] = []
-    for (let i = 0; i < max; i += 1) {
-      result.push(...diffValues(base[i], current[i], `${pointer}/${i}`))
+// 检测是否是旧格式
+const isOldFormat = (records: unknown[]): records is OldPatchRecord[] => {
+  if (records.length === 0) return false
+  const first = records[0] as Record<string, unknown>
+  return 'path' in first && 'value' in first && !('content' in first)
+}
+
+// 迁移旧格式到新格式
+const migrateOldRecords = async (
+  oldRecords: OldPatchRecord[],
+  readFile: (path: string) => Promise<string>
+): Promise<VersionRecord[]> => {
+  // 按 file+profile 分组
+  const groups: Record<string, OldPatchRecord[]> = {}
+  const profilesByFile: Record<string, string[]> = {}
+  
+  oldRecords.forEach((record) => {
+    const key = `${record.file}|||${record.profile}`
+    if (!groups[key]) groups[key] = []
+    groups[key].push(record)
+    
+    if (!profilesByFile[record.file]) profilesByFile[record.file] = []
+    if (!profilesByFile[record.file].includes(record.profile)) {
+      profilesByFile[record.file].push(record.profile)
     }
-    return result
+  })
+  
+  const newRecords: VersionRecord[] = []
+  
+  for (const file of Object.keys(profilesByFile)) {
+    let baseContent: string
+    try {
+      baseContent = await readFile(file)
+    } catch {
+      // 文件不存在，跳过这个文件的所有版本
+      continue
+    }
+    
+    for (const profile of profilesByFile[file]) {
+      const key = `${file}|||${profile}`
+      const patches = groups[key]?.filter(p => p.path !== '__placeholder__') ?? []
+      
+      // 应用 patches 得到版本内容
+      const versionContent = patches.length > 0 
+        ? applyPatches(baseContent, patches)
+        : baseContent
+      
+      newRecords.push({
+        file,
+        profile,
+        content: versionContent
+      })
+    }
   }
-  if (typeof base !== 'object' || typeof current !== 'object' || base === null || current === null) {
-    return [pointer]
-  }
-  const baseObj = base as Record<string, unknown>
-  const currentObj = current as Record<string, unknown>
-  const keys = new Set([...Object.keys(baseObj), ...Object.keys(currentObj)])
-  const result: string[] = []
-  for (const key of keys) {
-    result.push(...diffValues(baseObj[key], currentObj[key], `${pointer}/${key}`))
-  }
-  return result
+  
+  return newRecords
 }
 
 function App() {
   // ============ 基础状态 ============
-  const [records, setRecords] = useState<PatchRecord[]>([])
+  const [records, setRecords] = useState<VersionRecord[]>([])
   const [files, setFiles] = useState<string[]>([])
   const [profiles, setProfiles] = useState<Record<string, string[]>>({})
   const [activeFile, setActiveFile] = useState<string | null>(null)
   const [activeProfile, setActiveProfile] = useState<string | null>(null)
-  const [baselineByFile, setBaselineByFile] = useState<Record<string, string>>({})
+  const [diskContentByFile, setDiskContentByFile] = useState<Record<string, string>>({})
   const [appliedProfileByFile, setAppliedProfileByFile] = useState<Record<string, string>>({})
   
   // ============ 编辑器状态 ============
-  const [sourceContent, setSourceContent] = useState<string>('')
-  const [rightContent, setRightContent] = useState<string>('')
+  const [sourceContent, setSourceContent] = useState<string>('')  // 左侧：当前磁盘内容
+  const [rightContent, setRightContent] = useState<string>('')    // 右侧：版本内容
   const [diffEditor, setDiffEditor] = useState<any>(null)
-  const [lastEditedSide, setLastEditedSide] = useState<'left' | 'right' | null>(null)
   
   // ============ UI 状态 ============
   const [status, setStatus] = useState<string>('')
@@ -100,45 +142,29 @@ function App() {
   const [renameInput, setRenameInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<{ file: string; profile: string } | null>(null)
   
-  // ============ 关键：用于追踪右侧内容的"快照" ============
-  // 这是切换版本时右侧应该显示的内容，用于判断是否有未保存的修改
+  // ============ 用于追踪右侧内容的"快照"，判断是否有未保存的修改 ============
   const [snapshotRightContent, setSnapshotRightContent] = useState<string>('')
-  
-  // 用于防止程序设置内容时触发脏检测
-  const isProgrammaticChangeRef = useRef(false)
 
   // ============ 计算属性 ============
   
-  // 计算当前版本在 JSONL 中存储的内容
-  const computeVersionContent = (file: string, profile: string, baseline: string, recordList: PatchRecord[]) => {
-    const patches = recordList.filter(
-      (r) => r.file === file && r.profile === profile && r.path !== '__placeholder__'
-    )
-    return applyPatches(baseline, patches)
+  // 获取版本存储的内容
+  const getVersionContent = (file: string, profile: string, recordList: VersionRecord[]) => {
+    const record = recordList.find(r => r.file === file && r.profile === profile)
+    return record?.content ?? null
   }
 
-  // 计算 pendingPaths（用于保存时提取差异路径）
-  const pendingPaths = useMemo(() => {
-    try {
-      const baseline = activeFile ? (baselineByFile[activeFile] ?? sourceContent) : sourceContent
-      const baseObj = JSON.parse(baseline)
-      const currentObj = JSON.parse(rightContent)
-      const diffs = diffValues(baseObj, currentObj, '')
-      return diffs.filter((path) => path !== '')
-    } catch {
-      return []
-    }
-  }, [activeFile, baselineByFile, sourceContent, rightContent])
-
   // ============ 保存按钮显示逻辑 ============
-  // 条件：选中了版本 && 右侧内容与快照不同
   const isDirty = useMemo(() => {
     if (!activeFile || !activeProfile) return false
     if (!snapshotRightContent) return false
     return rightContent !== snapshotRightContent
   }, [activeFile, activeProfile, rightContent, snapshotRightContent])
 
-  const leftDirty = activeFile ? baselineByFile[activeFile] && baselineByFile[activeFile] !== sourceContent : false
+  const leftDirty = useMemo(() => {
+    if (!activeFile) return false
+    const diskContent = diskContentByFile[activeFile]
+    return diskContent && diskContent !== sourceContent
+  }, [activeFile, diskContentByFile, sourceContent])
 
   // ============ 初始化：启动时加载数据并检测当前生效版本 ============
   useEffect(() => {
@@ -149,7 +175,20 @@ function App() {
     
     const initializeApp = async () => {
       const data = await window.api!.readStorage()
-      const normalized = (data as PatchRecord[]) ?? []
+      const rawRecords = (data ?? []) as unknown[]
+      
+      // 检测并迁移旧格式
+      let normalized: VersionRecord[]
+      if (isOldFormat(rawRecords)) {
+        console.log('检测到旧格式数据，正在迁移...')
+        normalized = await migrateOldRecords(rawRecords, window.api!.readFile)
+        // 保存迁移后的数据
+        await window.api!.writeStorage(normalized as unknown as Array<Record<string, unknown>>)
+        console.log('迁移完成，共', normalized.length, '个版本')
+      } else {
+        normalized = rawRecords as VersionRecord[]
+      }
+      
       setRecords(normalized)
       
       const fileSet = Array.from(new Set(normalized.map((r) => r.file)))
@@ -166,16 +205,17 @@ function App() {
       
       // 读取所有文件并检测当前生效版本
       const appliedMap: Record<string, string> = {}
-      const baselineMap: Record<string, string> = {}
+      const diskMap: Record<string, string> = {}
       
       for (const file of fileSet) {
         try {
           const diskContent = await window.api!.readFile(file)
-          baselineMap[file] = diskContent
+          diskMap[file] = diskContent
           
+          // 检测哪个版本与磁盘内容匹配
           const fileProfiles = profileMap[file] ?? []
           for (const profile of fileProfiles) {
-            const versionContent = computeVersionContent(file, profile, diskContent, normalized)
+            const versionContent = getVersionContent(file, profile, normalized)
             if (versionContent === diskContent) {
               appliedMap[file] = profile
               break
@@ -186,7 +226,7 @@ function App() {
         }
       }
       
-      setBaselineByFile(baselineMap)
+      setDiskContentByFile(diskMap)
       setAppliedProfileByFile(appliedMap)
     }
     
@@ -194,26 +234,23 @@ function App() {
   }, [])
 
   // ============ 切换文件时加载内容 ============
-  // 注意：只加载文件内容到左侧，不重置 activeProfile
-  // activeProfile 的处理由 handleSelectProfile 和版本切换的 useEffect 负责
   useEffect(() => {
     if (!activeFile || !window.api) return
     
     const loadFile = async () => {
-      let content = baselineByFile[activeFile]
+      let content = diskContentByFile[activeFile]
       if (!content) {
         try {
           content = await window.api!.readFile(activeFile)
-          setBaselineByFile((prev) => ({ ...prev, [activeFile]: content }))
+          setDiskContentByFile((prev) => ({ ...prev, [activeFile]: content }))
         } catch (err) {
           setError(String(err))
           return
         }
       }
       
-      isProgrammaticChangeRef.current = true
       setSourceContent(content)
-      // 如果没有选中版本，右侧也显示原文件内容
+      // 如果没有选中版本，右侧也显示磁盘内容
       if (!activeProfile) {
         setRightContent(content)
         setSnapshotRightContent(content)
@@ -221,21 +258,21 @@ function App() {
     }
     
     loadFile()
-  }, [activeFile, activeProfile, baselineByFile])
+  }, [activeFile, activeProfile, diskContentByFile])
 
   // ============ 切换版本时更新右侧内容 ============
   useEffect(() => {
     if (!activeFile || !activeProfile) return
     
-    const baseline = baselineByFile[activeFile]
-    if (!baseline) return
+    const diskContent = diskContentByFile[activeFile]
+    if (!diskContent) return
     
-    const versionContent = computeVersionContent(activeFile, activeProfile, baseline, records)
+    // 获取版本存储的内容，如果没有则使用磁盘内容
+    const versionContent = getVersionContent(activeFile, activeProfile, records) ?? diskContent
     
-    isProgrammaticChangeRef.current = true
     setRightContent(versionContent)
-    setSnapshotRightContent(versionContent)  // 更新快照
-  }, [activeFile, activeProfile, baselineByFile, records])
+    setSnapshotRightContent(versionContent)
+  }, [activeFile, activeProfile, diskContentByFile, records])
 
   // ============ 监听编辑器内容变化 ============
   useEffect(() => {
@@ -248,17 +285,10 @@ function App() {
     if (!originalModel || !modifiedModel) return
     
     const sub1 = originalModel.onDidChangeContent(() => {
-      setLastEditedSide('left')
       setSourceContent(originalModel.getValue())
     })
     
     const sub2 = modifiedModel.onDidChangeContent(() => {
-      // 如果是程序设置的内容，跳过
-      if (isProgrammaticChangeRef.current) {
-        isProgrammaticChangeRef.current = false
-        return
-      }
-      setLastEditedSide('right')
       setRightContent(modifiedModel.getValue())
     })
     
@@ -267,18 +297,6 @@ function App() {
       sub2.dispose()
     }
   }, [diffEditor])
-
-  // ============ 左侧编辑时同步更新右侧 ============
-  useEffect(() => {
-    if (!activeFile || !activeProfile) return
-    if (lastEditedSide !== 'left') return
-    
-    const patches = records.filter((r) => r.file === activeFile && r.profile === activeProfile)
-    const updated = applyPatches(sourceContent, patches)
-    
-    isProgrammaticChangeRef.current = true
-    setRightContent(updated)
-  }, [sourceContent, activeFile, activeProfile, records, lastEditedSide])
 
   // ============ 操作函数 ============
   
@@ -315,16 +333,26 @@ function App() {
     if (!activeFile) return
     const trimmed = profileInput.trim()
     if (!trimmed) return
+    
     setProfiles((prev) => ({
       ...prev,
       [activeFile]: [...new Set([...(prev[activeFile] ?? []), trimmed])],
     }))
     setActiveProfile(trimmed)
     setShowProfileModal(false)
-    const newRecords = [...records, { file: activeFile, profile: trimmed, path: '__placeholder__', value: 'null' }]
+    
+    // 新版本初始内容 = 当前磁盘内容
+    const diskContent = diskContentByFile[activeFile] ?? sourceContent
+    const newRecord: VersionRecord = {
+      file: activeFile,
+      profile: trimmed,
+      content: diskContent
+    }
+    const newRecords = [...records, newRecord]
     setRecords(newRecords)
+    
     if (window.api) {
-      window.api.writeStorage(newRecords)
+      window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
     }
   }
 
@@ -333,6 +361,7 @@ function App() {
     setActiveProfile(name)
   }
 
+  // 保存并应用当前版本
   const handleSaveAndApplyProfile = async () => {
     setError('')
     setStatus('')
@@ -340,94 +369,108 @@ function App() {
       setError('请选择文件与版本')
       return
     }
-    if (pendingPaths.length === 0) {
-      setError('没有检测到改动')
-      return
-    }
-    const root = parseTree(rightContent)
-    if (!root) {
-      setError('JSON 解析失败，无法保存')
+    
+    // 验证 JSON 有效性
+    try {
+      JSON.parse(rightContent)
+    } catch {
+      setError('JSON 格式无效，无法保存')
       return
     }
     
-    // 移除旧的 patches，添加新的
-    const newRecords: PatchRecord[] = records.filter(
-      (r) => !(r.file === activeFile && r.profile === activeProfile)
+    // 更新版本记录
+    const existingIndex = records.findIndex(
+      r => r.file === activeFile && r.profile === activeProfile
     )
-    const patches: PatchRecord[] = pendingPaths
-      .map((path) => {
-        const range = getRangeForPointer(root, path)
-        if (!range) return null
-        return {
-          file: activeFile,
-          profile: activeProfile,
-          path,
-          value: extractValueText(rightContent, range),
-        }
-      })
-      .filter(Boolean) as PatchRecord[]
     
-    const merged = [...newRecords, ...patches]
-    setRecords(merged)
+    let newRecords: VersionRecord[]
+    if (existingIndex >= 0) {
+      newRecords = [...records]
+      newRecords[existingIndex] = {
+        file: activeFile,
+        profile: activeProfile,
+        content: rightContent
+      }
+    } else {
+      newRecords = [...records, {
+        file: activeFile,
+        profile: activeProfile,
+        content: rightContent
+      }]
+    }
+    
+    setRecords(newRecords)
     
     if (!window.api) return
-    await window.api.writeStorage(merged)
+    await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
     
-    // 保存成功后，更新快照为当前内容
+    // 保存成功后，更新快照
     setSnapshotRightContent(rightContent)
     
-    // 应用到文件
+    // 应用到磁盘文件
     await window.api.writeFile(activeFile, rightContent)
-    setBaselineByFile((prev) => ({ ...prev, [activeFile]: rightContent }))
+    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: rightContent }))
     setAppliedProfileByFile((prev) => ({ ...prev, [activeFile]: activeProfile }))
     
-    isProgrammaticChangeRef.current = true
+    // 更新左侧显示
     setSourceContent(rightContent)
     
     setStatus('已保存并应用版本')
   }
 
+  // 应用指定版本（不修改版本内容，只写入磁盘）
   const handleApplyProfile = async (file: string, profile: string) => {
     setError('')
     setStatus('')
     if (!window.api) return
     
-    const content = await window.api.readFile(file)
-    const patchList = records.filter((r) => r.file === file && r.profile === profile && r.path !== '__placeholder__')
-    const updated = applyPatches(content, patchList)
-    await window.api.writeFile(file, updated)
+    const versionContent = getVersionContent(file, profile, records)
+    if (!versionContent) {
+      setError('版本内容不存在')
+      return
+    }
+    
+    // 写入磁盘
+    await window.api.writeFile(file, versionContent)
     
     // 更新状态
-    setBaselineByFile((prev) => ({ ...prev, [file]: updated }))
+    setDiskContentByFile((prev) => ({ ...prev, [file]: versionContent }))
     setAppliedProfileByFile((prev) => ({ ...prev, [file]: profile }))
     
+    // 如果是当前文件，更新显示
     if (activeFile === file) {
-      isProgrammaticChangeRef.current = true
-      setSourceContent(updated)
-      setRightContent(updated)
-      setSnapshotRightContent(updated)
+      setSourceContent(versionContent)
+      if (activeProfile === profile) {
+        setRightContent(versionContent)
+        setSnapshotRightContent(versionContent)
+      }
     }
     
     setStatus('已应用版本')
   }
 
-  const handleSaveAllVersions = async () => {
+  // 保存左侧编辑并更新所有版本（保持版本间的差异）
+  const handleSaveLeftSide = async () => {
     if (!activeFile || !window.api) return
-    await window.api.writeFile(activeFile, sourceContent)
-    setBaselineByFile((prev) => ({ ...prev, [activeFile]: sourceContent }))
     
-    if (activeProfile) {
-      const patches = records.filter((r) => r.file === activeFile && r.profile === activeProfile)
-      const updated = applyPatches(sourceContent, patches)
-      isProgrammaticChangeRef.current = true
-      setRightContent(updated)
-      setSnapshotRightContent(updated)
-    } else {
-      isProgrammaticChangeRef.current = true
+    // 写入磁盘
+    await window.api.writeFile(activeFile, sourceContent)
+    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: sourceContent }))
+    
+    // 清除当前生效版本标记（因为磁盘内容已改变）
+    setAppliedProfileByFile((prev) => {
+      const newMap = { ...prev }
+      delete newMap[activeFile]
+      return newMap
+    })
+    
+    // 更新快照
+    if (!activeProfile) {
       setRightContent(sourceContent)
       setSnapshotRightContent(sourceContent)
     }
-    setStatus('已保存并应用到所有版本')
+    
+    setStatus('已保存源文件')
   }
 
   const handleRenameProfile = (file: string, profile: string) => {
@@ -439,39 +482,77 @@ function App() {
     setDeleteTarget({ file, profile })
   }
 
-  const confirmRenameProfile = () => {
+  const confirmRenameProfile = async () => {
     if (!renameTarget) return
     const trimmed = renameInput.trim()
     if (!trimmed) return
+    
     setProfiles((prev) => ({
       ...prev,
-      [renameTarget.file]: (prev[renameTarget.file] ?? []).map((p) => (p === renameTarget.profile ? trimmed : p)),
+      [renameTarget.file]: (prev[renameTarget.file] ?? []).map((p) => 
+        p === renameTarget.profile ? trimmed : p
+      ),
     }))
-    setRecords((prev) =>
-      prev.map((record) =>
-        record.file === renameTarget.file && record.profile === renameTarget.profile
-          ? { ...record, profile: trimmed }
-          : record
-      )
+    
+    const newRecords = records.map((record) =>
+      record.file === renameTarget.file && record.profile === renameTarget.profile
+        ? { ...record, profile: trimmed }
+        : record
     )
-    if (activeProfile === renameTarget.profile) setActiveProfile(trimmed)
+    setRecords(newRecords)
+    
+    if (window.api) {
+      await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
+    }
+    
+    if (activeProfile === renameTarget.profile) {
+      setActiveProfile(trimmed)
+    }
+    
+    // 更新 appliedProfileByFile
+    if (appliedProfileByFile[renameTarget.file] === renameTarget.profile) {
+      setAppliedProfileByFile((prev) => ({ ...prev, [renameTarget.file]: trimmed }))
+    }
+    
     setRenameTarget(null)
   }
 
-  const confirmDeleteProfile = () => {
+  const confirmDeleteProfile = async () => {
     if (!deleteTarget) return
+    
     setProfiles((prev) => ({
       ...prev,
       [deleteTarget.file]: (prev[deleteTarget.file] ?? []).filter((p) => p !== deleteTarget.profile),
     }))
-    setRecords((prev) => prev.filter((record) => !(record.file === deleteTarget.file && record.profile === deleteTarget.profile)))
-    if (activeProfile === deleteTarget.profile) setActiveProfile(null)
+    
+    const newRecords = records.filter(
+      (record) => !(record.file === deleteTarget.file && record.profile === deleteTarget.profile)
+    )
+    setRecords(newRecords)
+    
+    if (window.api) {
+      await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
+    }
+    
+    if (activeProfile === deleteTarget.profile) {
+      setActiveProfile(null)
+    }
+    
+    // 清除 appliedProfileByFile
+    if (appliedProfileByFile[deleteTarget.file] === deleteTarget.profile) {
+      setAppliedProfileByFile((prev) => {
+        const newMap = { ...prev }
+        delete newMap[deleteTarget.file]
+        return newMap
+      })
+    }
+    
     setDeleteTarget(null)
   }
 
   const handleExport = async () => {
     if (!window.api) return
-    await window.api.exportStorage(records)
+    await window.api.exportStorage(records as unknown as Array<Record<string, unknown>>)
     setStatus('已导出配置')
   }
 
@@ -479,7 +560,7 @@ function App() {
     if (!window.api) return
     const imported = await window.api.importStorage()
     if (!imported) return
-    const incoming = imported as PatchRecord[]
+    const incoming = imported as unknown as VersionRecord[]
     setRecords(incoming)
     const fileSet = Array.from(new Set(incoming.map((r) => r.file)))
     setFiles(fileSet)
@@ -491,7 +572,7 @@ function App() {
       }
     })
     setProfiles(profileMap)
-    await window.api.writeStorage(incoming)
+    await window.api.writeStorage(incoming as unknown as Array<Record<string, unknown>>)
     setStatus('已导入配置')
   }
 
@@ -509,6 +590,13 @@ function App() {
         verticalScrollbarSize: 8,
         horizontalScrollbarSize: 8,
       },
+      overviewRulerBorder: false,
+      overviewRulerLanes: 0,
+      hideCursorInOverviewRuler: true,
+      lineNumbersMinChars: 3,
+      folding: false,
+      glyphMargin: false,
+      padding: { top: 8, bottom: 8 },
     }),
     []
   )
@@ -571,9 +659,9 @@ function App() {
           <div className="panel-body diff-body">
             <div className="diff-labels">
               <div className="diff-label-left">
-                <span className="diff-label-text">源文件内容</span>
+                <span className="diff-label-text">磁盘文件内容</span>
                 {leftDirty && (
-                  <button className="diff-label-btn" onClick={handleSaveAllVersions}>保存并应用到所有版本</button>
+                  <button className="diff-label-btn" onClick={handleSaveLeftSide}>保存到磁盘</button>
                 )}
               </div>
               <div className="diff-label-right">
@@ -589,7 +677,11 @@ function App() {
                 original={sourceContent}
                 modified={rightContent}
                 onMount={(instance) => setDiffEditor(instance)}
-                options={{ ...editorOptions, originalEditable: true }}
+                options={{ 
+                  ...editorOptions, 
+                  originalEditable: true,
+                  renderOverviewRuler: false,
+                }}
               />
             </div>
           </div>

@@ -5,6 +5,13 @@ export type PatchRecord = {
   value: string;
 };
 
+// 新的版本记录格式 - 存储完整内容
+export type VersionRecord = {
+  file: string;
+  profile: string;
+  content: string;
+};
+
 export type FileEntry = {
   path: string;
   profiles: string[];

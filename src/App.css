@@ -329,6 +329,10 @@
 
 /* ============ Diff Panel Styles ============ */
 
+.diff-panel {
+  min-width: 0;
+}
+
 .diff-panel .panel-body {
   padding: 0;
   display: flex;
@@ -400,21 +404,6 @@
   flex: 1;
   min-height: 0;
   overflow: hidden;
-}
-
-/* Hide Monaco's thick gutter/margin areas */
-.diff-editor-wrapper .monaco-diff-editor .editor-scrollable {
-  left: 0 !important;
-}
-
-.diff-editor-wrapper .monaco-diff-editor .diffOverview {
-  width: 0 !important;
-  display: none !important;
-}
-
-.diff-editor-wrapper .monaco-diff-editor .diffViewport {
-  width: 0 !important;
-  display: none !important;
 }
 
 /* ============ End Diff Panel Styles ============ */
