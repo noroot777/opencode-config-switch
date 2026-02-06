@@ -1,7 +1,7 @@
 import { DiffEditor } from '@monaco-editor/react'
 import { parseTree } from 'jsonc-parser'
 import type { Node as JsonNode } from 'jsonc-parser'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 interface VersionRecord {
@@ -128,9 +128,17 @@ function App() {
   const [appliedProfileByFile, setAppliedProfileByFile] = useState<Record<string, string>>({})
   
   // ============ 编辑器状态 ============
-  const [sourceContent, setSourceContent] = useState<string>('')  // 左侧：当前磁盘内容
-  const [rightContent, setRightContent] = useState<string>('')    // 右侧：版本内容
   const [diffEditor, setDiffEditor] = useState<any>(null)
+  
+  // 使用 ref 存储编辑器内容，避免每次输入触发重渲染
+  const sourceContentRef = useRef<string>('')
+  const rightContentRef = useRef<string>('')
+  const snapshotRightContentRef = useRef<string>('')
+  const snapshotSourceContentRef = useRef<string>('')  // 用于检测左侧是否有修改
+  
+  // 用于触发 UI 更新的状态（仅在需要显示/隐藏按钮时更新）
+  const [isDirty, setIsDirty] = useState(false)
+  const [leftDirty, setLeftDirty] = useState(false)
   
   // ============ UI 状态 ============
   const [status, setStatus] = useState<string>('')
@@ -142,29 +150,35 @@ function App() {
   const [renameInput, setRenameInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<{ file: string; profile: string } | null>(null)
   
-  // ============ 用于追踪右侧内容的"快照"，判断是否有未保存的修改 ============
-  const [snapshotRightContent, setSnapshotRightContent] = useState<string>('')
+  // 用于显示当前版本名（避免频繁更新）
+  const [displayProfile, setDisplayProfile] = useState<string | null>(null)
 
   // ============ 计算属性 ============
   
   // 获取版本存储的内容
-  const getVersionContent = (file: string, profile: string, recordList: VersionRecord[]) => {
+  const getVersionContent = useCallback((file: string, profile: string, recordList: VersionRecord[]) => {
     const record = recordList.find(r => r.file === file && r.profile === profile)
     return record?.content ?? null
-  }
+  }, [])
 
-  // ============ 保存按钮显示逻辑 ============
-  const isDirty = useMemo(() => {
-    if (!activeFile || !activeProfile) return false
-    if (!snapshotRightContent) return false
-    return rightContent !== snapshotRightContent
-  }, [activeFile, activeProfile, rightContent, snapshotRightContent])
-
-  const leftDirty = useMemo(() => {
-    if (!activeFile) return false
-    const diskContent = diskContentByFile[activeFile]
-    return diskContent && diskContent !== sourceContent
-  }, [activeFile, diskContentByFile, sourceContent])
+  // ============ 更新脏状态的函数 ============
+  const updateDirtyState = useCallback(() => {
+    if (!activeFile || !activeProfile) {
+      setIsDirty(false)
+    } else {
+      const currentRight = rightContentRef.current
+      const snapshot = snapshotRightContentRef.current
+      setIsDirty(currentRight !== snapshot)
+    }
+    
+    if (!activeFile) {
+      setLeftDirty(false)
+    } else {
+      const currentSource = sourceContentRef.current
+      const snapshot = snapshotSourceContentRef.current
+      setLeftDirty(currentSource !== snapshot)
+    }
+  }, [activeFile, activeProfile])
 
   // ============ 初始化：启动时加载数据并检测当前生效版本 ============
   useEffect(() => {
@@ -231,7 +245,7 @@ function App() {
     }
     
     initializeApp()
-  }, [])
+  }, [getVersionContent])
 
   // ============ 切换文件时加载内容 ============
   useEffect(() => {
@@ -249,20 +263,42 @@ function App() {
         }
       }
       
-      setSourceContent(content)
+      // 更新 ref
+      sourceContentRef.current = content
+      snapshotSourceContentRef.current = content
+      
       // 如果没有选中版本，右侧也显示磁盘内容
       if (!activeProfile) {
-        setRightContent(content)
-        setSnapshotRightContent(content)
+        rightContentRef.current = content
+        snapshotRightContentRef.current = content
       }
+      
+      // 通过 Monaco API 设置内容
+      if (diffEditor) {
+        const originalModel = diffEditor.getOriginalEditor().getModel()
+        const modifiedModel = diffEditor.getModifiedEditor().getModel()
+        if (originalModel && originalModel.getValue() !== content) {
+          originalModel.setValue(content)
+        }
+        if (!activeProfile && modifiedModel && modifiedModel.getValue() !== content) {
+          modifiedModel.setValue(content)
+        }
+      }
+      
+      updateDirtyState()
     }
     
     loadFile()
-  }, [activeFile, activeProfile, diskContentByFile])
+  }, [activeFile, activeProfile, diskContentByFile, diffEditor, updateDirtyState])
 
   // ============ 切换版本时更新右侧内容 ============
   useEffect(() => {
-    if (!activeFile || !activeProfile) return
+    if (!activeFile || !activeProfile) {
+      setDisplayProfile(null)
+      return
+    }
+    
+    setDisplayProfile(activeProfile)
     
     const diskContent = diskContentByFile[activeFile]
     if (!diskContent) return
@@ -270,9 +306,20 @@ function App() {
     // 获取版本存储的内容，如果没有则使用磁盘内容
     const versionContent = getVersionContent(activeFile, activeProfile, records) ?? diskContent
     
-    setRightContent(versionContent)
-    setSnapshotRightContent(versionContent)
-  }, [activeFile, activeProfile, diskContentByFile, records])
+    // 更新 ref
+    rightContentRef.current = versionContent
+    snapshotRightContentRef.current = versionContent
+    
+    // 通过 Monaco API 设置内容
+    if (diffEditor) {
+      const modifiedModel = diffEditor.getModifiedEditor().getModel()
+      if (modifiedModel && modifiedModel.getValue() !== versionContent) {
+        modifiedModel.setValue(versionContent)
+      }
+    }
+    
+    updateDirtyState()
+  }, [activeFile, activeProfile, diskContentByFile, records, diffEditor, getVersionContent, updateDirtyState])
 
   // ============ 监听编辑器内容变化 ============
   useEffect(() => {
@@ -285,18 +332,30 @@ function App() {
     if (!originalModel || !modifiedModel) return
     
     const sub1 = originalModel.onDidChangeContent(() => {
-      setSourceContent(originalModel.getValue())
+      sourceContentRef.current = originalModel.getValue()
+      // 检查脏状态
+      const newLeftDirty = sourceContentRef.current !== snapshotSourceContentRef.current
+      if (newLeftDirty !== leftDirty) {
+        setLeftDirty(newLeftDirty)
+      }
     })
     
     const sub2 = modifiedModel.onDidChangeContent(() => {
-      setRightContent(modifiedModel.getValue())
+      rightContentRef.current = modifiedModel.getValue()
+      // 检查脏状态
+      if (activeFile && activeProfile) {
+        const newIsDirty = rightContentRef.current !== snapshotRightContentRef.current
+        if (newIsDirty !== isDirty) {
+          setIsDirty(newIsDirty)
+        }
+      }
     })
     
     return () => {
       sub1.dispose()
       sub2.dispose()
     }
-  }, [diffEditor])
+  }, [diffEditor, activeFile, activeProfile, isDirty, leftDirty])
 
   // ============ 操作函数 ============
   
@@ -342,7 +401,7 @@ function App() {
     setShowProfileModal(false)
     
     // 新版本初始内容 = 当前磁盘内容
-    const diskContent = diskContentByFile[activeFile] ?? sourceContent
+    const diskContent = diskContentByFile[activeFile] ?? sourceContentRef.current
     const newRecord: VersionRecord = {
       file: activeFile,
       profile: trimmed,
@@ -370,9 +429,11 @@ function App() {
       return
     }
     
+    const currentContent = rightContentRef.current
+    
     // 验证 JSON 有效性
     try {
-      JSON.parse(rightContent)
+      JSON.parse(currentContent)
     } catch {
       setError('JSON 格式无效，无法保存')
       return
@@ -389,13 +450,13 @@ function App() {
       newRecords[existingIndex] = {
         file: activeFile,
         profile: activeProfile,
-        content: rightContent
+        content: currentContent
       }
     } else {
       newRecords = [...records, {
         file: activeFile,
         profile: activeProfile,
-        content: rightContent
+        content: currentContent
       }]
     }
     
@@ -405,15 +466,25 @@ function App() {
     await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
     
     // 保存成功后，更新快照
-    setSnapshotRightContent(rightContent)
+    snapshotRightContentRef.current = currentContent
+    setIsDirty(false)
     
     // 应用到磁盘文件
-    await window.api.writeFile(activeFile, rightContent)
-    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: rightContent }))
+    await window.api.writeFile(activeFile, currentContent)
+    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: currentContent }))
     setAppliedProfileByFile((prev) => ({ ...prev, [activeFile]: activeProfile }))
     
-    // 更新左侧显示
-    setSourceContent(rightContent)
+    // 更新左侧显示和快照
+    sourceContentRef.current = currentContent
+    snapshotSourceContentRef.current = currentContent
+    setLeftDirty(false)
+    
+    if (diffEditor) {
+      const originalModel = diffEditor.getOriginalEditor().getModel()
+      if (originalModel && originalModel.getValue() !== currentContent) {
+        originalModel.setValue(currentContent)
+      }
+    }
     
     setStatus('已保存并应用版本')
   }
@@ -439,23 +510,57 @@ function App() {
     
     // 如果是当前文件，更新显示
     if (activeFile === file) {
-      setSourceContent(versionContent)
+      sourceContentRef.current = versionContent
+      snapshotSourceContentRef.current = versionContent
+      setLeftDirty(false)
+      
+      if (diffEditor) {
+        const originalModel = diffEditor.getOriginalEditor().getModel()
+        if (originalModel && originalModel.getValue() !== versionContent) {
+          originalModel.setValue(versionContent)
+        }
+      }
+      
       if (activeProfile === profile) {
-        setRightContent(versionContent)
-        setSnapshotRightContent(versionContent)
+        rightContentRef.current = versionContent
+        snapshotRightContentRef.current = versionContent
+        setIsDirty(false)
+        
+        if (diffEditor) {
+          const modifiedModel = diffEditor.getModifiedEditor().getModel()
+          if (modifiedModel && modifiedModel.getValue() !== versionContent) {
+            modifiedModel.setValue(versionContent)
+          }
+        }
       }
     }
     
     setStatus('已应用版本')
   }
 
-  // 保存左侧编辑并更新所有版本（保持版本间的差异）
+  // 保存左侧编辑到磁盘
   const handleSaveLeftSide = async () => {
     if (!activeFile || !window.api) return
+    setError('')
+    setStatus('')
+    
+    const currentContent = sourceContentRef.current
+    
+    // 验证 JSON 格式
+    try {
+      JSON.parse(currentContent)
+    } catch {
+      setError('JSON 格式无效，无法保存')
+      return
+    }
     
     // 写入磁盘
-    await window.api.writeFile(activeFile, sourceContent)
-    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: sourceContent }))
+    await window.api.writeFile(activeFile, currentContent)
+    setDiskContentByFile((prev) => ({ ...prev, [activeFile]: currentContent }))
+    
+    // 更新快照
+    snapshotSourceContentRef.current = currentContent
+    setLeftDirty(false)
     
     // 清除当前生效版本标记（因为磁盘内容已改变）
     setAppliedProfileByFile((prev) => {
@@ -464,13 +569,20 @@ function App() {
       return newMap
     })
     
-    // 更新快照
+    // 如果没有选中版本，右侧也同步
     if (!activeProfile) {
-      setRightContent(sourceContent)
-      setSnapshotRightContent(sourceContent)
+      rightContentRef.current = currentContent
+      snapshotRightContentRef.current = currentContent
+      
+      if (diffEditor) {
+        const modifiedModel = diffEditor.getModifiedEditor().getModel()
+        if (modifiedModel && modifiedModel.getValue() !== currentContent) {
+          modifiedModel.setValue(currentContent)
+        }
+      }
     }
     
-    setStatus('已保存源文件')
+    setStatus('已保存到磁盘')
   }
 
   const handleRenameProfile = (file: string, profile: string) => {
@@ -665,7 +777,7 @@ function App() {
                 )}
               </div>
               <div className="diff-label-right">
-                <span className="diff-label-text">版本：{activeProfile ?? '未选择'}</span>
+                <span className="diff-label-text">版本：{displayProfile ?? '未选择'}</span>
                 {isDirty && (
                   <button className="diff-label-btn primary" onClick={handleSaveAndApplyProfile}>保存并应用</button>
                 )}
@@ -674,8 +786,7 @@ function App() {
             <div className="diff-editor-wrapper">
               <DiffEditor
                 height="100%"
-                original={sourceContent}
-                modified={rightContent}
+                language="json"
                 onMount={(instance) => setDiffEditor(instance)}
                 options={{ 
                   ...editorOptions, 
