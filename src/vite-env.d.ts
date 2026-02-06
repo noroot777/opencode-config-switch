@@ -2,10 +2,10 @@
 
 interface Window {
   api?: {
-    readStorage: () => Promise<Array<Record<string, unknown>>>;
-    writeStorage: (records: Array<Record<string, unknown>>) => Promise<boolean>;
-    exportStorage: (records: Array<Record<string, unknown>>) => Promise<string | null>;
-    importStorage: () => Promise<Array<Record<string, unknown>> | null>;
+    readStorage: () => Promise<unknown>;
+    writeStorage: (data: unknown) => Promise<boolean>;
+    exportStorage: (data: unknown) => Promise<string | null>;
+    importStorage: () => Promise<unknown | null>;
     openJsonFile: () => Promise<string | null>;
     readFile: (filePath: string) => Promise<string>;
     writeFile: (filePath: string, content: string) => Promise<boolean>;

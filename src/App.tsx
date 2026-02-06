@@ -1,131 +1,115 @@
 import { DiffEditor } from '@monaco-editor/react'
-import { parseTree } from 'jsonc-parser'
-import type { Node as JsonNode } from 'jsonc-parser'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import type { StorageData, VersionRecord, FullContentRecord, OldPatchRecord, VersionHealth } from './types'
+import { applyPatches, extractPatches, checkVersionsHealth } from './patchUtils'
 
-interface VersionRecord {
-  file: string
-  profile: string
-  content: string  // 存储完整内容
+// ============ 格式检测与迁移 ============
+
+// 检测 v2 patch-based 格式
+const isV2Format = (data: unknown): data is StorageData => {
+  if (!data || typeof data !== 'object') return false
+  const obj = data as Record<string, unknown>
+  return obj.version === 2 && 'baselines' in obj && 'versions' in obj
 }
 
-// 旧格式 - 用于迁移
-interface OldPatchRecord {
-  file: string
-  profile: string
-  path: string
-  value: string
-}
-
-// ============ 旧格式迁移工具函数 ============
-
-const getRangeForPointer = (root: JsonNode | undefined, pointer: string): { start: number; end: number } | null => {
-  if (!root) return null
-  if (!pointer || pointer === '/') return { start: root.offset, end: root.offset + root.length }
-  const segments = pointer.split('/').filter(Boolean)
-  let current: JsonNode | undefined = root
-  for (const segment of segments) {
-    if (!current) return null
-    if (current.type === 'object') {
-      const property: JsonNode | undefined = current.children?.find((child) => child.children?.[0]?.value === segment)
-      current = property?.children?.[1]
-    } else if (current.type === 'array') {
-      const index = Number(segment)
-      if (Number.isNaN(index)) return null
-      current = current.children?.[index]
-    } else {
-      return null
-    }
-  }
-  if (!current) return null
-  return { start: current.offset, end: current.offset + current.length }
-}
-
-const applyPatches = (content: string, patches: OldPatchRecord[]) => {
-  const root = parseTree(content)
-  if (!root) return content
-  let updated = content
-  const ranges = patches
-    .map((patch) => ({ patch, range: getRangeForPointer(root, patch.path) }))
-    .filter((item) => item.range)
-    .sort((a, b) => (b.range!.start - a.range!.start))
-  for (const item of ranges) {
-    updated =
-      updated.slice(0, item.range!.start) +
-      item.patch.value +
-      updated.slice(item.range!.end)
-  }
-  return updated
-}
-
-// 检测是否是旧格式
-const isOldFormat = (records: unknown[]): records is OldPatchRecord[] => {
+// 检测 v1 旧 patch 格式
+const isOldPatchFormat = (records: unknown[]): records is OldPatchRecord[] => {
   if (records.length === 0) return false
   const first = records[0] as Record<string, unknown>
   return 'path' in first && 'value' in first && !('content' in first)
 }
 
-// 迁移旧格式到新格式
-const migrateOldRecords = async (
+// 检测 v1.5 full-content 格式
+const isFullContentFormat = (records: unknown[]): records is FullContentRecord[] => {
+  if (records.length === 0) return false
+  const first = records[0] as Record<string, unknown>
+  return 'content' in first && 'file' in first && 'profile' in first
+}
+
+// 从 full-content 格式迁移到 v2
+const migrateFromFullContent = (
+  records: FullContentRecord[],
+  diskContents: Record<string, string>
+): StorageData => {
+  const baselines: Record<string, string> = {}
+  const versions: VersionRecord[] = []
+
+  // 按 file 分组
+  const byFile: Record<string, FullContentRecord[]> = {}
+  for (const r of records) {
+    if (!byFile[r.file]) byFile[r.file] = []
+    byFile[r.file].push(r)
+  }
+
+  for (const [file, fileRecords] of Object.entries(byFile)) {
+    // 基线 = 当前磁盘内容
+    const baseline = diskContents[file] ?? fileRecords[0].content
+    baselines[file] = baseline
+
+    for (const record of fileRecords) {
+      const patches = extractPatches(baseline, record.content)
+      versions.push({ file, profile: record.profile, patches })
+    }
+  }
+
+  return { version: 2, baselines, versions }
+}
+
+// 从 v1 旧 patch 格式迁移到 v2
+const migrateFromOldPatches = async (
   oldRecords: OldPatchRecord[],
   readFile: (path: string) => Promise<string>
-): Promise<VersionRecord[]> => {
+): Promise<StorageData> => {
+  const baselines: Record<string, string> = {}
+  const versions: VersionRecord[] = []
+
   // 按 file+profile 分组
   const groups: Record<string, OldPatchRecord[]> = {}
   const profilesByFile: Record<string, string[]> = {}
-  
-  oldRecords.forEach((record) => {
+  for (const record of oldRecords) {
     const key = `${record.file}|||${record.profile}`
     if (!groups[key]) groups[key] = []
     groups[key].push(record)
-    
     if (!profilesByFile[record.file]) profilesByFile[record.file] = []
     if (!profilesByFile[record.file].includes(record.profile)) {
       profilesByFile[record.file].push(record.profile)
     }
-  })
-  
-  const newRecords: VersionRecord[] = []
-  
+  }
+
   for (const file of Object.keys(profilesByFile)) {
     let baseContent: string
     try {
       baseContent = await readFile(file)
     } catch {
-      // 文件不存在，跳过这个文件的所有版本
       continue
     }
-    
+    baselines[file] = baseContent
+
     for (const profile of profilesByFile[file]) {
       const key = `${file}|||${profile}`
-      const patches = groups[key]?.filter(p => p.path !== '__placeholder__') ?? []
-      
-      // 应用 patches 得到版本内容
-      const versionContent = patches.length > 0 
-        ? applyPatches(baseContent, patches)
-        : baseContent
-      
-      newRecords.push({
-        file,
-        profile,
-        content: versionContent
-      })
+      const oldPatches = groups[key]?.filter(p => p.path !== '__placeholder__') ?? []
+      // 旧格式的 patches 直接转成新格式
+      const patches = oldPatches.map(p => ({ path: p.path, value: p.value }))
+      versions.push({ file, profile, patches })
     }
   }
-  
-  return newRecords
+
+  return { version: 2, baselines, versions }
 }
 
 function App() {
-  // ============ 基础状态 ============
-  const [records, setRecords] = useState<VersionRecord[]>([])
+  // ============ 核心数据状态（v2 格式）============
+  const [storageData, setStorageData] = useState<StorageData>({ version: 2, baselines: {}, versions: [] })
   const [files, setFiles] = useState<string[]>([])
   const [profiles, setProfiles] = useState<Record<string, string[]>>({})
   const [activeFile, setActiveFile] = useState<string | null>(null)
   const [activeProfile, setActiveProfile] = useState<string | null>(null)
   const [diskContentByFile, setDiskContentByFile] = useState<Record<string, string>>({})
   const [appliedProfileByFile, setAppliedProfileByFile] = useState<Record<string, string>>({})
+  
+  // ============ 版本健康状态 ============
+  const [versionHealthMap, setVersionHealthMap] = useState<Record<string, VersionHealth>>({})
   
   // ============ 编辑器状态 ============
   const [diffEditor, setDiffEditor] = useState<any>(null)
@@ -134,7 +118,7 @@ function App() {
   const sourceContentRef = useRef<string>('')
   const rightContentRef = useRef<string>('')
   const snapshotRightContentRef = useRef<string>('')
-  const snapshotSourceContentRef = useRef<string>('')  // 用于检测左侧是否有修改
+  const snapshotSourceContentRef = useRef<string>('')
   
   // 用于触发 UI 更新的状态（仅在需要显示/隐藏按钮时更新）
   const [isDirty, setIsDirty] = useState(false)
@@ -149,16 +133,34 @@ function App() {
   const [renameTarget, setRenameTarget] = useState<{ file: string; profile: string } | null>(null)
   const [renameInput, setRenameInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<{ file: string; profile: string } | null>(null)
-  
-  // 用于显示当前版本名（避免频繁更新）
   const [displayProfile, setDisplayProfile] = useState<string | null>(null)
 
-  // ============ 计算属性 ============
+  // ============ 辅助函数 ============
   
-  // 获取版本存储的内容
-  const getVersionContent = useCallback((file: string, profile: string, recordList: VersionRecord[]) => {
-    const record = recordList.find(r => r.file === file && r.profile === profile)
-    return record?.content ?? null
+  // 持久化 storageData
+  const persistStorage = useCallback(async (data: StorageData) => {
+    if (!window.api) return
+    await window.api.writeStorage(data)
+  }, [])
+
+  // 从 storageData 获取版本应用后的内容
+  const getVersionContent = useCallback((file: string, profile: string, data: StorageData): string | null => {
+    const baseline = data.baselines[file]
+    if (!baseline) return null
+    const version = data.versions.find(v => v.file === file && v.profile === profile)
+    if (!version) return null
+    const result = applyPatches(baseline, version.patches)
+    return result.content
+  }, [])
+
+  // 从 profiles 和 versions 中提取 file/profile 结构
+  const rebuildProfileMap = useCallback((versions: VersionRecord[]): Record<string, string[]> => {
+    const map: Record<string, string[]> = {}
+    for (const v of versions) {
+      if (!map[v.file]) map[v.file] = []
+      if (!map[v.file].includes(v.profile)) map[v.file].push(v.profile)
+    }
+    return map
   }, [])
 
   // ============ 更新脏状态的函数 ============
@@ -188,33 +190,53 @@ function App() {
     }
     
     const initializeApp = async () => {
-      const data = await window.api!.readStorage()
-      const rawRecords = (data ?? []) as unknown[]
+      const rawData = await window.api!.readStorage()
       
-      // 检测并迁移旧格式
-      let normalized: VersionRecord[]
-      if (isOldFormat(rawRecords)) {
-        console.log('检测到旧格式数据，正在迁移...')
-        normalized = await migrateOldRecords(rawRecords, window.api!.readFile)
+      let data: StorageData
+      
+      if (isV2Format(rawData)) {
+        // 已经是 v2 格式
+        data = rawData
+      } else if (Array.isArray(rawData) && rawData.length > 0) {
+        // 需要迁移
+        // 先读取所有文件的磁盘内容用于迁移
+        const allFiles = new Set((rawData as Array<Record<string, string>>).map(r => r.file))
+        const diskMap: Record<string, string> = {}
+        for (const file of allFiles) {
+          try {
+            diskMap[file] = await window.api!.readFile(file)
+          } catch { /* skip */ }
+        }
+        
+        if (isOldPatchFormat(rawData)) {
+          console.log('检测到 v1 旧 patch 格式，正在迁移...')
+          data = await migrateFromOldPatches(rawData, window.api!.readFile)
+        } else if (isFullContentFormat(rawData)) {
+          console.log('检测到 v1.5 full-content 格式，正在迁移...')
+          data = migrateFromFullContent(rawData, diskMap)
+        } else {
+          // 未知格式，初始化空数据
+          data = { version: 2, baselines: {}, versions: [] }
+        }
+        
         // 保存迁移后的数据
-        await window.api!.writeStorage(normalized as unknown as Array<Record<string, unknown>>)
-        console.log('迁移完成，共', normalized.length, '个版本')
+        await persistStorage(data)
+        console.log('迁移完成')
       } else {
-        normalized = rawRecords as VersionRecord[]
+        // 空数据或未知
+        data = { version: 2, baselines: {}, versions: [] }
       }
       
-      setRecords(normalized)
+      setStorageData(data)
       
-      const fileSet = Array.from(new Set(normalized.map((r) => r.file)))
+      const fileSet = Object.keys(data.baselines)
+      // 也加入 versions 中有但 baselines 中没有的文件
+      for (const v of data.versions) {
+        if (!fileSet.includes(v.file)) fileSet.push(v.file)
+      }
       setFiles(fileSet)
       
-      const profileMap: Record<string, string[]> = {}
-      normalized.forEach((record) => {
-        if (!profileMap[record.file]) profileMap[record.file] = []
-        if (!profileMap[record.file].includes(record.profile)) {
-          profileMap[record.file].push(record.profile)
-        }
-      })
+      const profileMap = rebuildProfileMap(data.versions)
       setProfiles(profileMap)
       
       // 读取所有文件并检测当前生效版本
@@ -226,10 +248,13 @@ function App() {
           const diskContent = await window.api!.readFile(file)
           diskMap[file] = diskContent
           
+          // 更新 baselines（以磁盘内容为准）
+          data.baselines[file] = diskContent
+          
           // 检测哪个版本与磁盘内容匹配
           const fileProfiles = profileMap[file] ?? []
           for (const profile of fileProfiles) {
-            const versionContent = getVersionContent(file, profile, normalized)
+            const versionContent = getVersionContent(file, profile, data)
             if (versionContent === diskContent) {
               appliedMap[file] = profile
               break
@@ -240,12 +265,24 @@ function App() {
         }
       }
       
+      // 检查所有版本健康状态
+      const healthMap: Record<string, VersionHealth> = {}
+      for (const file of fileSet) {
+        const baseline = data.baselines[file]
+        if (!baseline) continue
+        const unhealthy = checkVersionsHealth(baseline, data.versions, file)
+        for (const vh of unhealthy) {
+          healthMap[`${vh.file}|||${vh.profile}`] = vh
+        }
+      }
+      setVersionHealthMap(healthMap)
+      
       setDiskContentByFile(diskMap)
       setAppliedProfileByFile(appliedMap)
     }
     
     initializeApp()
-  }, [getVersionContent])
+  }, [getVersionContent, persistStorage, rebuildProfileMap])
 
   // ============ 切换文件时加载内容 ============
   useEffect(() => {
@@ -300,11 +337,20 @@ function App() {
     
     setDisplayProfile(activeProfile)
     
-    const diskContent = diskContentByFile[activeFile]
-    if (!diskContent) return
+    const baseline = storageData.baselines[activeFile]
+    if (!baseline) return
     
-    // 获取版本存储的内容，如果没有则使用磁盘内容
-    const versionContent = getVersionContent(activeFile, activeProfile, records) ?? diskContent
+    // 从 baseline + patches 得到版本内容
+    const versionContent = getVersionContent(activeFile, activeProfile, storageData) ?? baseline
+    
+    // 检查是否有失效的 patches
+    const healthKey = `${activeFile}|||${activeProfile}`
+    const health = versionHealthMap[healthKey]
+    if (health && health.invalidPatches.length > 0) {
+      setError(`版本 ${activeProfile} 有 ${health.invalidPatches.length} 个配置项因路径变更无法应用：${health.invalidPatches.join(', ')}`)
+    } else {
+      setError('')
+    }
     
     // 更新 ref
     rightContentRef.current = versionContent
@@ -319,7 +365,7 @@ function App() {
     }
     
     updateDirtyState()
-  }, [activeFile, activeProfile, diskContentByFile, records, diffEditor, getVersionContent, updateDirtyState])
+  }, [activeFile, activeProfile, storageData, diffEditor, getVersionContent, updateDirtyState, versionHealthMap])
 
   // ============ 监听编辑器内容变化 ============
   useEffect(() => {
@@ -388,7 +434,7 @@ function App() {
     setShowProfileModal(true)
   }
 
-  const confirmAddProfile = () => {
+  const confirmAddProfile = async () => {
     if (!activeFile) return
     const trimmed = profileInput.trim()
     if (!trimmed) return
@@ -400,19 +446,23 @@ function App() {
     setActiveProfile(trimmed)
     setShowProfileModal(false)
     
-    // 新版本初始内容 = 当前磁盘内容
-    const diskContent = diskContentByFile[activeFile] ?? sourceContentRef.current
-    const newRecord: VersionRecord = {
+    // 新版本 patches = 空（与基线完全相同）
+    const newVersion: VersionRecord = {
       file: activeFile,
       profile: trimmed,
-      content: diskContent
+      patches: []
     }
-    const newRecords = [...records, newRecord]
-    setRecords(newRecords)
-    
-    if (window.api) {
-      window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
+    const newData: StorageData = {
+      ...storageData,
+      // 确保 baselines 存在
+      baselines: {
+        ...storageData.baselines,
+        [activeFile]: storageData.baselines[activeFile] ?? diskContentByFile[activeFile] ?? sourceContentRef.current
+      },
+      versions: [...storageData.versions, newVersion]
     }
+    setStorageData(newData)
+    await persistStorage(newData)
   }
 
   const handleSelectProfile = (file: string, name: string) => {
@@ -439,31 +489,26 @@ function App() {
       return
     }
     
-    // 更新版本记录
-    const existingIndex = records.findIndex(
-      r => r.file === activeFile && r.profile === activeProfile
-    )
-    
-    let newRecords: VersionRecord[]
-    if (existingIndex >= 0) {
-      newRecords = [...records]
-      newRecords[existingIndex] = {
-        file: activeFile,
-        profile: activeProfile,
-        content: currentContent
-      }
-    } else {
-      newRecords = [...records, {
-        file: activeFile,
-        profile: activeProfile,
-        content: currentContent
-      }]
+    // 从当前内容与基线提取 patches
+    const baseline = storageData.baselines[activeFile] ?? diskContentByFile[activeFile]
+    if (!baseline) {
+      setError('基线内容不存在')
+      return
     }
     
-    setRecords(newRecords)
+    const patches = extractPatches(baseline, currentContent)
+    
+    // 更新版本记录
+    const newVersions = storageData.versions.filter(
+      v => !(v.file === activeFile && v.profile === activeProfile)
+    )
+    newVersions.push({ file: activeFile, profile: activeProfile, patches })
+    
+    const newData: StorageData = { ...storageData, versions: newVersions }
+    setStorageData(newData)
     
     if (!window.api) return
-    await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
+    await persistStorage(newData)
     
     // 保存成功后，更新快照
     snapshotRightContentRef.current = currentContent
@@ -473,6 +518,13 @@ function App() {
     await window.api.writeFile(activeFile, currentContent)
     setDiskContentByFile((prev) => ({ ...prev, [activeFile]: currentContent }))
     setAppliedProfileByFile((prev) => ({ ...prev, [activeFile]: activeProfile }))
+    
+    // 清除该版本的健康警告
+    setVersionHealthMap((prev) => {
+      const newMap = { ...prev }
+      delete newMap[`${activeFile}|||${activeProfile}`]
+      return newMap
+    })
     
     // 更新左侧显示和快照
     sourceContentRef.current = currentContent
@@ -495,10 +547,17 @@ function App() {
     setStatus('')
     if (!window.api) return
     
-    const versionContent = getVersionContent(file, profile, records)
+    const versionContent = getVersionContent(file, profile, storageData)
     if (!versionContent) {
       setError('版本内容不存在')
       return
+    }
+    
+    // 检查健康状态
+    const healthKey = `${file}|||${profile}`
+    const health = versionHealthMap[healthKey]
+    if (health && health.invalidPatches.length > 0) {
+      setError(`警告：版本 ${profile} 有 ${health.invalidPatches.length} 个失效配置项，应用的内容可能不完整`)
     }
     
     // 写入磁盘
@@ -538,7 +597,7 @@ function App() {
     setStatus('已应用版本')
   }
 
-  // 保存左侧编辑到磁盘
+  // 保存左侧编辑到磁盘（更新基线）
   const handleSaveLeftSide = async () => {
     if (!activeFile || !window.api) return
     setError('')
@@ -558,6 +617,14 @@ function App() {
     await window.api.writeFile(activeFile, currentContent)
     setDiskContentByFile((prev) => ({ ...prev, [activeFile]: currentContent }))
     
+    // 更新基线
+    const newData: StorageData = {
+      ...storageData,
+      baselines: { ...storageData.baselines, [activeFile]: currentContent }
+    }
+    setStorageData(newData)
+    await persistStorage(newData)
+    
     // 更新快照
     snapshotSourceContentRef.current = currentContent
     setLeftDirty(false)
@@ -568,6 +635,28 @@ function App() {
       delete newMap[activeFile]
       return newMap
     })
+    
+    // 检查所有版本健康状态
+    const unhealthy = checkVersionsHealth(currentContent, newData.versions, activeFile)
+    const newHealthMap = { ...versionHealthMap }
+    // 先清除该文件的旧健康状态
+    for (const key of Object.keys(newHealthMap)) {
+      if (key.startsWith(`${activeFile}|||`)) {
+        delete newHealthMap[key]
+      }
+    }
+    // 添加新的不健康状态
+    for (const vh of unhealthy) {
+      newHealthMap[`${vh.file}|||${vh.profile}`] = vh
+    }
+    setVersionHealthMap(newHealthMap)
+    
+    if (unhealthy.length > 0) {
+      const warnings = unhealthy.map(vh => `${vh.profile}(${vh.invalidPatches.length}个失效)`).join(', ')
+      setStatus(`已保存到磁盘。注意：以下版本受影响：${warnings}`)
+    } else {
+      setStatus('已保存到磁盘')
+    }
     
     // 如果没有选中版本，右侧也同步
     if (!activeProfile) {
@@ -581,8 +670,6 @@ function App() {
         }
       }
     }
-    
-    setStatus('已保存到磁盘')
   }
 
   const handleRenameProfile = (file: string, profile: string) => {
@@ -606,16 +693,14 @@ function App() {
       ),
     }))
     
-    const newRecords = records.map((record) =>
-      record.file === renameTarget.file && record.profile === renameTarget.profile
-        ? { ...record, profile: trimmed }
-        : record
+    const newVersions = storageData.versions.map((v) =>
+      v.file === renameTarget.file && v.profile === renameTarget.profile
+        ? { ...v, profile: trimmed }
+        : v
     )
-    setRecords(newRecords)
-    
-    if (window.api) {
-      await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
-    }
+    const newData: StorageData = { ...storageData, versions: newVersions }
+    setStorageData(newData)
+    await persistStorage(newData)
     
     if (activeProfile === renameTarget.profile) {
       setActiveProfile(trimmed)
@@ -624,6 +709,18 @@ function App() {
     // 更新 appliedProfileByFile
     if (appliedProfileByFile[renameTarget.file] === renameTarget.profile) {
       setAppliedProfileByFile((prev) => ({ ...prev, [renameTarget.file]: trimmed }))
+    }
+    
+    // 更新健康状态 key
+    const oldKey = `${renameTarget.file}|||${renameTarget.profile}`
+    const newKey = `${renameTarget.file}|||${trimmed}`
+    if (versionHealthMap[oldKey]) {
+      setVersionHealthMap((prev) => {
+        const newMap = { ...prev }
+        newMap[newKey] = { ...newMap[oldKey], profile: trimmed }
+        delete newMap[oldKey]
+        return newMap
+      })
     }
     
     setRenameTarget(null)
@@ -637,14 +734,12 @@ function App() {
       [deleteTarget.file]: (prev[deleteTarget.file] ?? []).filter((p) => p !== deleteTarget.profile),
     }))
     
-    const newRecords = records.filter(
-      (record) => !(record.file === deleteTarget.file && record.profile === deleteTarget.profile)
+    const newVersions = storageData.versions.filter(
+      (v) => !(v.file === deleteTarget.file && v.profile === deleteTarget.profile)
     )
-    setRecords(newRecords)
-    
-    if (window.api) {
-      await window.api.writeStorage(newRecords as unknown as Array<Record<string, unknown>>)
-    }
+    const newData: StorageData = { ...storageData, versions: newVersions }
+    setStorageData(newData)
+    await persistStorage(newData)
     
     if (activeProfile === deleteTarget.profile) {
       setActiveProfile(null)
@@ -659,12 +754,22 @@ function App() {
       })
     }
     
+    // 清除健康状态
+    const healthKey = `${deleteTarget.file}|||${deleteTarget.profile}`
+    if (versionHealthMap[healthKey]) {
+      setVersionHealthMap((prev) => {
+        const newMap = { ...prev }
+        delete newMap[healthKey]
+        return newMap
+      })
+    }
+    
     setDeleteTarget(null)
   }
 
   const handleExport = async () => {
     if (!window.api) return
-    await window.api.exportStorage(records as unknown as Array<Record<string, unknown>>)
+    await window.api.exportStorage(storageData)
     setStatus('已导出配置')
   }
 
@@ -672,19 +777,24 @@ function App() {
     if (!window.api) return
     const imported = await window.api.importStorage()
     if (!imported) return
-    const incoming = imported as unknown as VersionRecord[]
-    setRecords(incoming)
-    const fileSet = Array.from(new Set(incoming.map((r) => r.file)))
+    
+    let data: StorageData
+    if (isV2Format(imported)) {
+      data = imported
+    } else {
+      // 导入的是旧格式，当作 full-content 处理
+      const incoming = imported as unknown as FullContentRecord[]
+      data = migrateFromFullContent(incoming, diskContentByFile)
+    }
+    
+    setStorageData(data)
+    const fileSet = Object.keys(data.baselines)
+    for (const v of data.versions) {
+      if (!fileSet.includes(v.file)) fileSet.push(v.file)
+    }
     setFiles(fileSet)
-    const profileMap: Record<string, string[]> = {}
-    incoming.forEach((record) => {
-      if (!profileMap[record.file]) profileMap[record.file] = []
-      if (!profileMap[record.file].includes(record.profile)) {
-        profileMap[record.file].push(record.profile)
-      }
-    })
-    setProfiles(profileMap)
-    await window.api.writeStorage(incoming as unknown as Array<Record<string, unknown>>)
+    setProfiles(rebuildProfileMap(data.versions))
+    await persistStorage(data)
     setStatus('已导入配置')
   }
 
@@ -736,10 +846,13 @@ function App() {
                   {(profiles[file] ?? []).map((profile) => (
                     <div
                       key={profile}
-                      className={`profile-item ${activeFile === file && activeProfile === profile ? 'active' : ''}`}
+                      className={`profile-item ${activeFile === file && activeProfile === profile ? 'active' : ''} ${versionHealthMap[`${file}|||${profile}`] ? 'warning' : ''}`}
                       onClick={() => handleSelectProfile(file, profile)}
                     >
-                      <span>{profile}</span>
+                      <span>
+                        {versionHealthMap[`${file}|||${profile}`] && <span className="profile-warning" title={`${versionHealthMap[`${file}|||${profile}`].invalidPatches.length} 个配置项失效`}>⚠ </span>}
+                        {profile}
+                      </span>
                       <div className="profile-inline">
                         {appliedProfileByFile[file] === profile && (
                           <span className="profile-label">当前生效</span>

@@ -149,23 +149,39 @@ app.on("window-all-closed", () => {
 
 ipcMain.handle("storage:read", async () => {
   const storagePath = await ensureUserDataFile();
-  return readJsonl(storagePath);
+  const lines = await readJsonl(storagePath);
+  // v2 格式：单行对象 { version: 2, baselines, versions }
+  if (lines.length === 1 && lines[0] && lines[0].version === 2) {
+    return lines[0];
+  }
+  // 旧格式：行数组
+  return lines;
 });
 
-ipcMain.handle("storage:write", async (_event, records) => {
+ipcMain.handle("storage:write", async (_event, data) => {
   const storagePath = await ensureUserDataFile();
-  await writeJsonl(storagePath, records);
+  // v2 格式：整个对象作为单行写入
+  if (data && data.version === 2) {
+    await fs.writeFile(storagePath, JSON.stringify(data) + "\n", "utf-8");
+  } else {
+    await writeJsonl(storagePath, Array.isArray(data) ? data : [data]);
+  }
   return true;
 });
 
-ipcMain.handle("storage:export", async (_event, records) => {
+ipcMain.handle("storage:export", async (_event, data) => {
   const { canceled, filePath } = await dialog.showSaveDialog({
     title: "导出配置",
     defaultPath: "profiles.jsonl",
     filters: [{ name: "JSONL", extensions: ["jsonl"] }],
   });
   if (canceled || !filePath) return null;
-  await writeJsonl(filePath, records);
+  // v2 格式：单个 JSON 对象
+  if (data && data.version === 2) {
+    await fs.writeFile(filePath, JSON.stringify(data) + "\n", "utf-8");
+  } else {
+    await writeJsonl(filePath, Array.isArray(data) ? data : [data]);
+  }
   return filePath;
 });
 
@@ -177,6 +193,10 @@ ipcMain.handle("storage:import", async () => {
   });
   if (canceled || !filePaths || filePaths.length === 0) return null;
   const records = await readJsonl(filePaths[0]);
+  // v2 格式：单行对象
+  if (records.length === 1 && records[0] && records[0].version === 2) {
+    return records[0];
+  }
   return records;
 });
 

@@ -202,6 +202,21 @@
   color: #1d4ed8;
 }
 
+.profile-item.warning {
+  border-color: #fbbf24;
+  background: #fffbeb;
+}
+
+.profile-item.warning.active {
+  background: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.profile-warning {
+  color: #d97706;
+  font-size: 12px;
+}
+
 .tree-node {
   font-size: 12px;
   line-height: 1.6;
