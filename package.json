@@ -1,7 +1,7 @@
 {
   "name": "opencode-config-switch",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "electron/main.js",
   "description": "OpenCode 配置切换器 - 管理多配置版本的桌面应用",
